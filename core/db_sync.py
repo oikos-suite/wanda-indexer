@@ -20,27 +20,44 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.embedder import EMBED_DIM, EMBEDDER_VERSION, MODEL_NAME as EMBED_MODEL_NAME
+from core import embedder
 from core.fingerprinter import sub_hash_halves
 
 EXTRACTOR_VERSION = 1
 DEFAULT_PACKAGE = "com.wander.android.debug"
-BUSY_TIMEOUT_MS = 30000
 
-# Kept byte-for-byte in step with Room's generated DDL for `TrackEmbeddingEntity`
-# (Android MIGRATION_24_25). The desktop indexer may run against a database whose
-# app has not been updated yet, so it creates the table itself if missing; Room's
-# migration uses the identical `CREATE TABLE IF NOT EXISTS`, so either order works.
+# What the indexer cannot work without.
+REQUIRED_TABLES = ("tracks",)
+
+# Milliseconds of track each stored segment advances, and how far short of a
+# track's declared duration its vectors may stop and still count as finished.
+# Both mirror `EmbeddingRepository`; the tolerance absorbs the half-second the
+# segmentation rounds off and the routine disagreement between a container's
+# declared duration and what decodes out of it.
+SEGMENT_HOP_MS = 500
+COVERAGE_TOLERANCE_MS = 5000
+
+# Read and written when present. The landmark and recording tables are legacy:
+# the app's schema has moved past them, and a current database has dropped them.
+# `track_embeddings` is the only index the app still reads for recognition, but
+# it is created on demand at write time (`ensure_embeddings_schema`), so a
+# database whose app predates it is not damaged either.
+OPTIONAL_TABLES = {"track_embeddings", "fingerprints", "track_features", "recording_fingerprints"}
+
+# Byte-for-byte Room's generated `createSql` for `TrackEmbeddingEntity` (see
+# `app/schemas/com.wander.android.core.database.WanderDatabase/49.json`), so this
+# can index a database whose app predates the table. Keep the two in step --
+# Room validates the schema it finds against the one it generated and refuses to
+# open a database that disagrees, on every launch.
 EMBEDDINGS_DDL = (
-    "CREATE TABLE IF NOT EXISTS track_embeddings ("
-    "trackId TEXT NOT NULL, vector BLOB NOT NULL, dim INTEGER NOT NULL, "
-    "model TEXT NOT NULL, version INTEGER NOT NULL, computedAt INTEGER NOT NULL, "
-    "PRIMARY KEY(trackId))"
+    "CREATE TABLE IF NOT EXISTS `track_embeddings` ("
+    "`trackId` TEXT NOT NULL, `vector` BLOB NOT NULL, `centroid` BLOB, "
+    "`dim` INTEGER NOT NULL, `model` TEXT NOT NULL, `version` INTEGER NOT NULL, "
+    "`computedAt` INTEGER NOT NULL, PRIMARY KEY(`trackId`))"
 )
-
-
-def ensure_embeddings_table(conn: sqlite3.Connection) -> None:
-    conn.execute(EMBEDDINGS_DDL)
+# The app's former MIGRATION_27_28, for a table created before `centroid` existed.
+EMBEDDINGS_CENTROID_DDL = "ALTER TABLE `track_embeddings` ADD COLUMN `centroid` BLOB DEFAULT NULL"
+BUSY_TIMEOUT_MS = 30000
 
 
 LYRICS_DDL = (
@@ -175,17 +192,20 @@ def quick_sanity(db_path: str) -> Tuple[bool, List[str]]:
     problems = []
     try:
         conn.execute("SELECT count(*) FROM sqlite_master;").fetchone()
-        for table in ("tracks", "track_features", "recording_fingerprints"):
+        present = set(_table_names(conn))
+        for table in REQUIRED_TABLES:
+            if table not in present:
+                problems.append(f"table {table} is missing")
+        # Every other index table is optional: `fingerprints` and the recording
+        # tables were dropped by the app once neural embeddings replaced them,
+        # `track_embeddings` is created on demand by the indexer, and a database
+        # that has moved on (or not yet caught up) is correct, not damaged. Only
+        # what is actually there is probed.
+        for table in sorted(present & (set(REQUIRED_TABLES) | OPTIONAL_TABLES)):
             try:
                 conn.execute(f"SELECT count(*) FROM {table};").fetchone()
             except sqlite3.DatabaseError as exc:
                 problems.append(f"table {table} is unreadable: {exc}")
-        # `fingerprints` is not probed: the landmark constellation has been replaced by the
-        # neural embedding, and a database that has had it dropped is the intended end state,
-        # not a damaged one. Probing it here reported every cut-over database as corrupt.
-        #
-        # track_embeddings is created on demand by the indexer; a database whose
-        # app predates it is not corrupt, so it is not in the probe list above.
     except sqlite3.DatabaseError as exc:
         problems.append(f"schema is unreadable: {exc}")
     finally:
@@ -666,8 +686,7 @@ class StagedDatabase:
 # --------------------------------------------------------------------------
 
 def get_pending_tracks(db_path: str, version: int = EXTRACTOR_VERSION,
-                       want_embeddings: bool = False,
-                       embedder_version: int = EMBEDDER_VERSION) -> List[Dict[str, Any]]:
+                       want_embeddings: bool = False) -> List[Dict[str, Any]]:
     """Tracks missing any part of their index, with per-stage flags.
 
     The old implementation used a pair of `id NOT IN (SELECT ...)` subqueries.
@@ -675,67 +694,75 @@ def get_pending_tracks(db_path: str, version: int = EXTRACTOR_VERSION,
     a subquery yielding any NULL returns *no rows at all* -- a silent "nothing
     to do". This uses LEFT JOINs, and reports which stages each track needs so
     a partially indexed track only redoes the missing parts.
+
+    Every join is optional in the same way: a stage whose table the database
+    does not have is not asked about, so a database that has been through the
+    cut-over (no `fingerprints`, no recording tables) scans cleanly instead of
+    dying with "no such table". The embedding stage is asked about only when
+    `want_embeddings` is set.
     """
     conn = connect(db_path, readonly=True)
     conn.row_factory = sqlite3.Row
-    # A database whose app predates the embedding feature has no track_embeddings
-    # table; the indexer creates it at write time (batch_insert_index_data), and
-    # until then every track counts as needing an embedding.
-    has_table = bool(conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='track_embeddings';"
-    ).fetchone())
-
-    # The landmark constellation is gone from any database that has been through the cut-over, so
-    # the join that reports it has to be optional in exactly the way the embedding join already is.
-    # Without this the whole scan died with "no such table: fingerprints".
-    has_landmarks = bool(conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fingerprints';"
-    ).fetchone())
-    if has_landmarks:
-        landmark_column = "(fp.trackId IS NULL) AS needs_landmarks"
-        landmark_join = ("LEFT JOIN (SELECT DISTINCT trackId FROM fingerprints) fp "
-                         "ON fp.trackId = t.id")
-        landmark_where = "fp.trackId IS NULL OR"
-    else:
-        landmark_column = "0 AS needs_landmarks"
-        landmark_join = ""
-        landmark_where = ""
-
-    if not want_embeddings:
-        embed_column = "0 AS needs_embedding"
-        embed_join = ""
-        embed_where = ""
-    elif has_table:
-        embed_column = "(te.trackId IS NULL) AS needs_embedding"
-        embed_join = ("LEFT JOIN (SELECT trackId FROM track_embeddings WHERE version = :ev) te "
-                      "ON te.trackId = t.id")
-        embed_where = "OR te.trackId IS NULL"
-    else:
-        embed_column = "1 AS needs_embedding"
-        embed_join = ""
-        embed_where = "OR 1"
-
     try:
+        present = set(_table_names(conn))
+        joins, flags, params = [], [], []
+
+        if want_embeddings and "track_embeddings" in present:
+            # The embedding arm asks two things, not one. A row exists, and its
+            # vectors reach the end of the track: indexing used to stop at 60
+            # seconds, so most stored rows describe a song's first minute and
+            # nothing after it. Mirrors `TrackEmbeddingDao.needingIndex`.
+            joins.append(
+                "LEFT JOIN track_embeddings te "
+                "ON te.trackId = t.id AND te.model = ? AND te.version = ?"
+            )
+            params += [embedder.MODEL_NAME, embedder.EMBEDDER_VERSION]
+            flags.append(
+                "(te.trackId IS NULL OR (t.durationMs > 0 AND "
+                f"(length(te.vector) / {embedder.EMBED_DIM}) * {SEGMENT_HOP_MS} "
+                f"< t.durationMs - {COVERAGE_TOLERANCE_MS})) AS needs_embedding"
+            )
+        elif want_embeddings:
+            # A database whose app predates the embedding feature has no
+            # track_embeddings table; the indexer creates it at write time
+            # (batch_insert_index_data), and until then every track needs one.
+            flags.append("1 AS needs_embedding")
+
+        if "fingerprints" in present:
+            joins.append(
+                "LEFT JOIN (SELECT DISTINCT trackId FROM fingerprints) fp ON fp.trackId = t.id"
+            )
+            flags.append("(fp.trackId IS NULL) AS needs_landmarks")
+        if "track_features" in present:
+            joins.append(
+                "LEFT JOIN (SELECT trackId FROM track_features WHERE version = ?) tf "
+                "ON tf.trackId = t.id"
+            )
+            params.append(version)
+            flags.append("(tf.trackId IS NULL) AS needs_features")
+        if "recording_fingerprints" in present:
+            joins.append(
+                "LEFT JOIN recording_fingerprints rf ON rf.trackId = t.id"
+            )
+            flags.append("(rf.trackId IS NULL) AS needs_recording_fp")
+
+        if not flags:
+            return []
+
+        # `WHERE` over the same expressions the flags select, so a track appears
+        # exactly when at least one stage still wants it.
+        wanted = " OR ".join(f.rsplit(" AS ", 1)[0] for f in flags)
         rows = conn.execute(
             f"""
             SELECT t.id, t.sourceTrackId, t.source, t.title, t.artist, t.album,
                    t.durationMs, t.streamUri, t.localFilePath,
-                   {landmark_column},
-                   (tf.trackId IS NULL) AS needs_features,
-                   (rf.trackId IS NULL) AS needs_recording_fp,
-                   {embed_column}
+                   {", ".join(flags)}
             FROM tracks t
-            {landmark_join}
-            LEFT JOIN (SELECT trackId FROM track_features WHERE version = :v) tf
-                   ON tf.trackId = t.id
-            LEFT JOIN recording_fingerprints rf
-                   ON rf.trackId = t.id
-            {embed_join}
-            WHERE {landmark_where} tf.trackId IS NULL OR rf.trackId IS NULL
-                  {embed_where}
+            {" ".join(joins)}
+            WHERE {wanted}
             ORDER BY t.source, t.id;
             """,
-            {"v": version, "ev": embedder_version},
+            tuple(params),
         ).fetchall()
     finally:
         conn.close()
@@ -743,9 +770,9 @@ def get_pending_tracks(db_path: str, version: int = EXTRACTOR_VERSION,
     pending = []
     for row in rows:
         track = dict(row)
-        for flag in ("needs_landmarks", "needs_features", "needs_recording_fp"):
-            track[flag] = bool(track[flag])
-        track["needs_embedding"] = bool(want_embeddings and track["needs_embedding"])
+        for flag in ("needs_landmarks", "needs_features",
+                     "needs_recording_fp", "needs_embedding"):
+            track[flag] = bool(track.get(flag, 0))
         pending.append(track)
     return pending
 
@@ -840,13 +867,33 @@ def backfill_sub_hashes(db_path: str, log=print, chunk_size: int = 200) -> int:
         conn.close()
 
 
+def ensure_embeddings_schema(conn: sqlite3.Connection) -> None:
+    """Creates `track_embeddings`, and its `centroid` column, if either is absent.
+
+    Two separate cases, because the app added them in two separate migrations
+    and a database pulled off a phone can be at either point. `CREATE TABLE IF
+    NOT EXISTS` alone is not enough: against a database that has the table but
+    not the column it succeeds and changes nothing, and the insert then fails on
+    a column that does not exist.
+
+    Adding the column here is safe in the direction that matters -- Room accepts
+    a nullable column it already declares, and it is the same `BLOB DEFAULT
+    NULL` that MIGRATION_27_28 added. It must stay that way; a column this writes
+    that the app's schema does not declare makes Room refuse to open the
+    database on every launch.
+    """
+    conn.execute(EMBEDDINGS_DDL)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(track_embeddings);")}
+    if "centroid" not in columns:
+        conn.execute(EMBEDDINGS_CENTROID_DDL)
+
+
 def count_index_rows(db_path: str) -> Dict[str, Optional[int]]:
-    """Row counts for the three index tables; None where the table is unreadable."""
+    """Row counts per index table; None where the table is absent or unreadable."""
     conn = connect(db_path, readonly=True)
     counts: Dict[str, Optional[int]] = {}
     try:
-        for table in ("tracks", "fingerprints", "track_features",
-                      "recording_fingerprints", "track_embeddings"):
+        for table in REQUIRED_TABLES + tuple(sorted(OPTIONAL_TABLES)):
             try:
                 counts[table] = conn.execute(f"SELECT count(*) FROM {table};").fetchone()[0]
             except sqlite3.DatabaseError:
@@ -854,6 +901,40 @@ def count_index_rows(db_path: str) -> Dict[str, Optional[int]]:
     finally:
         conn.close()
     return counts
+
+
+def embedding_coverage(db_path: str) -> Tuple[int, int, int]:
+    """(tracks, with a current embedding, of those reaching the end of the track).
+
+    Three numbers rather than one because "indexed" stopped being a yes or no
+    the moment tracks were indexed whole: a row can exist and still describe
+    only a song's first minute, which is what every row written before that
+    change does.
+    """
+    conn = connect(db_path, readonly=True)
+    try:
+        total = conn.execute("SELECT count(*) FROM tracks WHERE isLive = 0;").fetchone()[0]
+        if "track_embeddings" not in _table_names(conn):
+            # Not created yet: the first checkpoint that writes an embedding does.
+            return total, 0, 0
+        indexed = conn.execute(
+            "SELECT count(*) FROM track_embeddings WHERE model = ? AND version = ?;",
+            (embedder.MODEL_NAME, embedder.EMBEDDER_VERSION),
+        ).fetchone()[0]
+        complete = conn.execute(
+            f"""
+            SELECT count(*) FROM tracks t JOIN track_embeddings e ON e.trackId = t.id
+            WHERE e.model = ? AND e.version = ? AND (
+                t.durationMs <= 0
+                OR (length(e.vector) / {embedder.EMBED_DIM}) * {SEGMENT_HOP_MS}
+                   >= t.durationMs - {COVERAGE_TOLERANCE_MS}
+            );
+            """,
+            (embedder.MODEL_NAME, embedder.EMBEDDER_VERSION),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return total, indexed, complete
 
 
 def deduplicate_by_embeddings(
@@ -868,6 +949,9 @@ def deduplicate_by_embeddings(
     conn = connect(db_path)
     cur = conn.cursor()
     try:
+        if "track_embeddings" not in _table_names(conn):
+            log("[DEDUP] No track_embeddings table yet; nothing to compare.")
+            return 0
         cur.execute("""
             CREATE TABLE IF NOT EXISTS recording_links (
                 idA TEXT NOT NULL,
@@ -885,11 +969,11 @@ def deduplicate_by_embeddings(
         mean_vectors = {}
         for tid, blob in cur.execute(
             "SELECT trackId, vector FROM track_embeddings WHERE model = ? AND version = ?",
-            (EMBED_MODEL_NAME, EMBEDDER_VERSION),
+            (embedder.MODEL_NAME, embedder.EMBEDDER_VERSION),
         ).fetchall():
             if tid not in tracks:
                 continue
-            arr = np.frombuffer(blob, dtype=">f4").reshape(-1, EMBED_DIM)
+            arr = embedder.unpack(blob)
             embeddings[tid] = arr
             m = np.mean(arr, axis=0)
             norm = np.linalg.norm(m)
@@ -952,19 +1036,23 @@ def batch_insert_index_data(
     landmarks_by_track: Dict[str, List[Tuple[int, int]]],
     features_by_track: Dict[str, Dict[str, float]],
     recording_fps_by_track: Dict[str, bytes],
-    embeddings_by_track: Optional[Dict[str, bytes]] = None,
+    embeddings_by_track: Optional[Dict[str, Tuple[bytes, bytes]]] = None,
     version: int = EXTRACTOR_VERSION,
-    embedder_version: int = EMBEDDER_VERSION,
 ) -> Dict[str, int]:
-    """Commits one checkpoint atomically. Returns counts of rows written."""
-    embeddings_by_track = embeddings_by_track or {}
+    """Commits one checkpoint atomically. Returns counts of rows written.
+
+    `embeddings_by_track` maps a track id to `(vector, centroid)`, both already
+    packed by `core.embedder.pack` (int8, segment-major).
+    """
     conn = connect(db_path)
     now_ms = int(time.time() * 1000)
+    embeddings_by_track = embeddings_by_track or {}
 
     embedding_rows = [
-        (track_id, blob, EMBED_DIM, EMBED_MODEL_NAME, embedder_version, now_ms)
-        for track_id, blob in embeddings_by_track.items()
-        if blob
+        (track_id, vector, centroid, embedder.EMBED_DIM,
+         embedder.MODEL_NAME, embedder.EMBEDDER_VERSION, now_ms)
+        for track_id, (vector, centroid) in embeddings_by_track.items()
+        if vector
     ]
 
     landmark_rows = [
@@ -996,11 +1084,14 @@ def batch_insert_index_data(
     try:
         with conn:  # one transaction: commits together or rolls back together
             if embedding_rows:
-                ensure_embeddings_table(conn)
+                # REPLACE, not IGNORE: a re-measurement is a correction. Every
+                # row written before tracks were indexed whole covers only a
+                # song's first minute and is here to be overwritten.
+                ensure_embeddings_schema(conn)
                 conn.executemany(
                     "INSERT OR REPLACE INTO track_embeddings "
-                    "(trackId, vector, dim, model, version, computedAt) "
-                    "VALUES (?, ?, ?, ?, ?, ?);",
+                    "(trackId, vector, centroid, dim, model, version, computedAt) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?);",
                     embedding_rows,
                 )
             if landmark_rows:

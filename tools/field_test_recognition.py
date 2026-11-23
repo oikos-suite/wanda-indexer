@@ -45,7 +45,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core import db_sync
 from core.audio_pipeline import DECODE_OK, decode_audio_to_pcm, ffmpeg_path
 from core.config import load_env_file
-from core.embedder import HOP_SAMPLES, SEGMENT_SAMPLES, compute_embedding, model_available
+from core import embedder
+from core.embedder import HOP_SAMPLES, SEGMENT_SAMPLES
 from core.embedding_match import (
     MIN_MARGIN,
     MIN_SIMILARITY,
@@ -268,8 +269,9 @@ def main(argv=None):
               "fail, and the failure would say nothing about robustness.")
         return 2
 
-    if not model_available():
-        print("[ERROR] Embedder model not found. Expected models/wanda_embedder.tflite.")
+    if not embedder.is_available():
+        print("[ERROR] Embedder unavailable: no TFLite runtime, or the model could not be found "
+              "(models/wanda_embedder.tflite) or downloaded.")
         return 2
     if not ffmpeg_path():
         print("[ERROR] ffmpeg not found; audio cannot be decoded.")
@@ -361,8 +363,8 @@ def main(argv=None):
         return excerpt(samples, args.seconds, offset)
 
     def evaluate(clip, track):
-        blob = compute_embedding(clip)
-        query = np.frombuffer(blob, dtype=">f4").reshape(-1, 128).astype(np.float32)
+        # Quantised like the stored side, as the phone quantises its query.
+        query = embedder.unpack(embedder.pack(embedder.embed(clip)))
         if len(query) == 0:
             return None
         return Outcome(track["id"], f"{track['artist']} - {track['title']}",

@@ -14,7 +14,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from core.embedder import EMBED_DIM, EMBEDDER_VERSION, MODEL_NAME
+from core import embedder
+from core.embedder import EMBEDDER_VERSION, MODEL_NAME
 
 # The gate `EmbeddingRepository` applies on the phone. A query that ranks first but does not
 # clear both of these is still a "no match" to the user, so any tool reporting rank-1 alone
@@ -24,11 +25,13 @@ MIN_MARGIN = 0.04
 
 
 def unpack(blob: bytes) -> np.ndarray:
-    """The stored BLOB as `(n_segments, EMBED_DIM)` unit rows.
+    """The stored BLOB as `(n_segments, EMBED_DIM)` rows.
 
-    Big-endian float32, matching `core.embedder.compute_embedding` and `AudioEmbedder.pack`.
+    int8 at `QUANT_SCALE`, matching `core.embedder.pack` and `AudioEmbedder.pack`. A query
+    should go through the same rounding (`embedder.unpack(embedder.pack(v))`), as the phone's
+    does, so both sides of every comparison carry it.
     """
-    return np.frombuffer(blob, dtype=">f4").reshape(-1, EMBED_DIM).astype(np.float32)
+    return embedder.unpack(blob)
 
 
 def load_embeddings(conn) -> Dict[str, np.ndarray]:

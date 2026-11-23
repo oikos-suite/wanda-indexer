@@ -9,7 +9,7 @@ import csv
 import sqlite3
 import numpy as np
 
-from core.embedding_match import load_catalogue, score
+from core.embedding_match import load_embeddings, score
 
 
 def main(argv=None):
@@ -20,7 +20,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     conn = sqlite3.connect(args.database)
-    catalogue = load_catalogue(conn)
+    catalogue = load_embeddings(conn)
     if not catalogue:
         print("No embeddings found in catalogue.")
         return

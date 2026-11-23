@@ -25,10 +25,14 @@ fingerprinter.
 
 Rebuild with `tools/build_embedder_tflite.py` (see its docstring).
 
-## Segmentation contract (`EMBEDDER_VERSION = 1`)
+## Segmentation and storage contract (`EMBEDDER_VERSION = 2`)
 
-1-second segments (8000 samples), 0.5-second hop (4000 samples), tail zero-padded. A track is
-stored as its sequence of segment vectors, big-endian float32, in `track_embeddings.vector`.
+1-second segments (8000 samples), 0.5-second hop (4000 samples), tail zero-padded, over the whole
+track. A track is stored as its sequence of segment vectors in `track_embeddings.vector`, int8,
+one byte per component: `round(value * 255)` clamped to [-127, 127], segment-major. One
+L2-normalised mean per 30 s chunk goes in `track_embeddings.centroid`, packed the same way. The
+contract is `AudioEmbedder.kt` in the app; `core/embedder.py` documents it and
+`tools/check_parity.py` checks it.
 
 ## License
 
@@ -40,7 +44,8 @@ the combination is compliant; this derived model inherits AGPL-3.0. Do not relic
 ~35 MB (`SHA-256 50a26e9f…55aa`, 35 892 012 bytes).
 
 - **Desktop indexer**: keep the file here at `models/wanda_embedder.tflite` (or point
-  `--embed-model` elsewhere). If it's awkward in git, add it to `.gitattributes` as LFS or
+  `--embedder-model` elsewhere); without either, it is downloaded from the release asset into
+  `.wanda-cache/` and verified against the pinned SHA-256. If it's awkward in git, add it to `.gitattributes` as LFS or
   fetch it in CI.
 - **Android app**: **not bundled in the APK.** `EmbeddingModelManager` downloads it at runtime
   — offered during first-run setup (the "Song recognition" card) and from

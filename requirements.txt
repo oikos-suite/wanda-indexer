@@ -1,10 +1,11 @@
 # Core requirement.
 numpy>=1.24
 
-# Neural audio-fingerprint embeddings (core/embedder.py). Runs models/wanda_embedder.tflite.
-# 'ai-edge-litert' is the standalone TFLite runtime; a box with full 'tensorflow'
-# installed works too (core.embedder falls back to tensorflow.lite).
-ai-edge-litert>=1.0.1
+# TFLite runtime for the neural fingerprint (core/embedder.py), the index the app
+# searches. ai-edge-litert is Google's current wheel (Linux/macOS/Windows); an
+# installed tflite-runtime or full tensorflow also works. Without any of them the
+# indexer still runs, but skips embeddings.
+ai-edge-litert>=1.0.1; python_version >= "3.9"
 
 # Needed only for YouTube Music sources; install with the system package
 # manager if you prefer (it self-updates more reliably that way).

@@ -1,144 +1,284 @@
-"""Neural audio-fingerprint embeddings (TFLite).
+"""Neural audio fingerprints, byte-compatible with the Android app.
 
-Replaces the hand-built landmark constellation with a compact CNN: each 1-second
-segment of 8 kHz PCM becomes a 128-d L2-normalised vector, and a track is stored
-as the sequence of its segment vectors. Matching is then cosine similarity over a
-short window instead of a landmark-vote SQL join.
+The Wanda app recognises music by comparing a microphone clip against a stored
+sequence of 128-dimensional embeddings, one per half-second of every track. It
+can compute those itself, but it does it one streamed track at a time on a
+phone; this does the same arithmetic on a desktop, over the same database, with
+the network as the only bottleneck.
 
-The model (`models/wanda_embedder.tflite`) is the `nmfp-triplet` encoder from
-raraz15/neural-music-fp (ISMIR 2025, AGPL-3.0) with its mel front-end folded into
-the graph, so the exact same file runs here and in the Android app -- there is no
-Python/Kotlin numerical parity to keep in sync, unlike `fingerprinter`.
+The contract is fixed by `core/audio/fingerprint/AudioEmbedder.kt` in the app
+and must not drift from it -- a vector computed differently here is not a worse
+match, it is a different alphabet, and every comparison against it is noise:
 
-Input contract mirrors `audio_pipeline`: mono, 8 kHz, float32.
+    model         wanda_embedder.tflite, the `nmfp-triplet` encoder from
+                  raraz15/neural-music-fp with its mel front-end in the graph
+    input         (1, 8000) float32 -- one second of 8 kHz mono
+    output        (1, 128) L2-normalised
+    segmentation  1.0 s window, 0.5 s hop, tail zero-padded
+    storage       int8, `round(value * 255)`, segment-major, `n * 128` bytes
+    identity      model 'nmfp-triplet', version 2, dim 128
+
+`core/audio_pipeline.py` already decodes to exactly the input this wants -- mono
+8 kHz float32 -- so nothing resamples here.
+
+The interpreter is not fork-safe and is deliberately not built at import: it is
+created lazily, once per process, so the CPU pool's workers each get their own.
 """
+import hashlib
 import os
 import threading
+import urllib.request
 from typing import Optional
 
 import numpy as np
 
-# Bump when the model file or the segmentation below changes: it invalidates
-# every stored vector, exactly like EXTRACTOR_VERSION does for the DSP stages.
-EMBEDDER_VERSION = 1
 MODEL_NAME = "nmfp-triplet"
-
+EMBEDDER_VERSION = 2
 EMBED_DIM = 128
-SEGMENT_SAMPLES = 8000          # 1.0 s at 8 kHz -- the model's fixed input length
-HOP_SAMPLES = 4000             # 0.5 s, the fingerprint rate the model was trained at
 
-_DEFAULT_MODEL = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "models", "wanda_embedder.tflite",
+# Fixed-point scale for a stored component; see `AudioEmbedder.QUANT_SCALE`. The
+# model's output is L2-normalised over 128 dimensions, so no component is large
+# -- measured over 162,447 real vectors the extreme was 0.433, against the 0.498
+# that would clip here. Quantising costs at most 0.002 of match score, and saves
+# three quarters of a database that is otherwise ~250 MB for a 1400-track
+# library once tracks are indexed whole.
+QUANT_SCALE = 255
+
+SAMPLE_RATE = 8000
+SEGMENT_SAMPLES = 8000          # 1.0 s
+HOP_SAMPLES = 4000              # 0.5 s -- the model's training fingerprint rate
+
+# The asset the app downloads, so both sides run the identical file. Pinned by
+# digest: a truncated or substituted model produces plausible vectors that match
+# nothing, which is the one failure that would not announce itself.
+MODEL_URL = (
+    "https://github.com/oikos-suite/Wanda/releases/download/embedder-v1/wanda_embedder.tflite"
+)
+MODEL_SHA256 = "50a26e9f19dbaa35de7a1efda1c3b69d471e83f860c53c7df184431e754455aa"
+MODEL_SIZE_BYTES = 35_892_012
+MODEL_FILENAME = "wanda_embedder.tflite"
+
+# Where `models/README.md` and `tools/build_embedder_tflite.py` put the file. A
+# copy there of the pinned size is used before anything is downloaded.
+LOCAL_MODEL = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", MODEL_FILENAME
 )
 
-# One interpreter per process, created lazily. TFLite interpreters are not
-# thread-safe, so callers in a threaded context must serialise on `_LOCK`;
-# the indexer runs this in single-threaded worker processes, so it is free.
-_INTERPRETERS: dict = {}
-_LOCK = threading.Lock()
+_interpreter = None
+_interpreter_lock = threading.Lock()
 
 
-def default_model_path() -> str:
-    return _DEFAULT_MODEL
+class EmbedderUnavailable(RuntimeError):
+    """No TFLite runtime, or no model file. Indexing continues without embeddings."""
 
 
-def model_available(model_path: Optional[str] = None) -> bool:
-    return os.path.isfile(model_path or _DEFAULT_MODEL)
+def segment(samples: np.ndarray) -> np.ndarray:
+    """1 s windows at a 0.5 s hop, tail zero-padded. `(n, 8000)` float32.
 
-
-def _load_runtime():
-    """Returns an `Interpreter` class from whichever TFLite runtime is installed.
-
-    `ai-edge-litert` is the current name, `tflite-runtime` the old one; full
-    TensorFlow is the fallback so a dev box with it already installed just works.
+    Ported line for line from `AudioEmbedder.segment`, including the two padding
+    cases, because a window boundary half a hop out of step would shift every
+    stored vector against the ones the phone computes.
     """
+    pcm = np.ascontiguousarray(samples, dtype=np.float32)
+    if pcm.size < SEGMENT_SAMPLES:
+        pcm = np.pad(pcm, (0, SEGMENT_SAMPLES - pcm.size))
+
+    n = 1 + (pcm.size - SEGMENT_SAMPLES) // HOP_SAMPLES
+    remainder = pcm.size - ((n - 1) * HOP_SAMPLES + SEGMENT_SAMPLES)
+    if remainder > 0:
+        pcm = np.pad(pcm, (0, HOP_SAMPLES - remainder))
+        n += 1
+
+    # A strided view, not n copies: a 20-minute track is 2400 windows of 8000
+    # floats, and materialising them would be 77 MB per track per worker.
+    return np.lib.stride_tricks.as_strided(
+        pcm,
+        shape=(n, SEGMENT_SAMPLES),
+        strides=(pcm.strides[0] * HOP_SAMPLES, pcm.strides[0]),
+        writeable=False,
+    )
+
+
+def pack(vectors: np.ndarray) -> bytes:
+    """Segment vectors as the BLOB the app reads: one int8 per component.
+
+    `np.rint`, not `astype(np.int8)`, and clipped before the cast. Truncation
+    would bias every component towards zero, and an unclipped cast *wraps* --
+    0.6 * 255 = 153 becomes -103, a large positive number stored as a large
+    negative one. Neither announces itself; both simply stop matching.
+    """
+    v = np.asarray(vectors, dtype=np.float32)
+    q = np.clip(np.rint(v * QUANT_SCALE), -127, 127).astype(np.int8)
+    return np.ascontiguousarray(q).tobytes()
+
+
+def unpack(blob: bytes) -> np.ndarray:
+    """Inverse of `pack`, for tests and for `tools/check_recognition.py`."""
+    q = np.frombuffer(blob, dtype=np.int8).reshape(-1, EMBED_DIM)
+    return q.astype(np.float32) / QUANT_SCALE
+
+
+# Segments per summary chunk -- 60 at a 0.5 s hop, so thirty seconds. See
+# `EmbeddingRepository.SUMMARY_CHUNK_SEGMENTS`; the value was chosen by
+# measurement, and the two must agree or the phone's shortlist is reading
+# summaries of a different length than it expects.
+SUMMARY_CHUNK_SEGMENTS = 60
+
+
+def summary(vectors: np.ndarray) -> np.ndarray:
+    """One L2-normalised mean per 30 s chunk -- the app's search index.
+
+    The app shortlists a recognition by these before opening any track's
+    segments, so a row without them still matches but costs the phone the read
+    the column exists to avoid. A trailing part-chunk is folded into the one
+    before it rather than kept, matching `EmbeddingRepository.summaryOf`: a mean
+    over three seconds would be compared against the same threshold as a mean
+    over thirty.
+
+    One per track was the original design and is measurably too blunt -- a clip
+    resembles one moment of a song, not its average. On a real 1374-track index
+    a whole-track mean put the true track as low as rank 524; per 30 s chunk, no
+    lower than rank 2.
+    """
+    v = np.asarray(vectors, dtype=np.float32)
+    if len(v) == 0:
+        return np.zeros((0, EMBED_DIM), dtype=np.float32)
+    chunks = max(1, len(v) // SUMMARY_CHUNK_SEGMENTS)
+    out = np.empty((chunks, EMBED_DIM), dtype=np.float32)
+    for c in range(chunks):
+        start = c * SUMMARY_CHUNK_SEGMENTS
+        stop = len(v) if c == chunks - 1 else start + SUMMARY_CHUNK_SEGMENTS
+        m = v[start:stop].mean(axis=0)
+        n = float(np.linalg.norm(m))
+        out[c] = m / n if n > 0 else m
+    return out
+
+
+def model_path(cache_dir: str = ".wanda-cache", explicit: str = "") -> str:
+    """The model file, downloading and verifying it once if it is not here yet.
+
+    In order: `explicit`, then `models/wanda_embedder.tflite` beside this
+    checkout, then the cached download.
+    """
+    if explicit:
+        if not os.path.isfile(explicit):
+            raise EmbedderUnavailable(f"model file not found: {explicit}")
+        return explicit
+
+    if os.path.isfile(LOCAL_MODEL) and os.path.getsize(LOCAL_MODEL) == MODEL_SIZE_BYTES:
+        return LOCAL_MODEL
+
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, MODEL_FILENAME)
+    if os.path.isfile(path) and os.path.getsize(path) == MODEL_SIZE_BYTES:
+        return path
+
+    tmp = path + ".part"
     try:
-        from ai_edge_litert.interpreter import Interpreter  # type: ignore
-        return Interpreter
-    except ImportError:
+        with urllib.request.urlopen(MODEL_URL) as response, open(tmp, "wb") as out:
+            digest = hashlib.sha256()
+            while True:
+                block = response.read(1 << 20)
+                if not block:
+                    break
+                digest.update(block)
+                out.write(block)
+        if digest.hexdigest() != MODEL_SHA256:
+            raise EmbedderUnavailable(
+                f"model checksum mismatch (got {digest.hexdigest()})"
+            )
+        os.replace(tmp, path)
+    except EmbedderUnavailable:
+        _unlink(tmp)
+        raise
+    except OSError as exc:
+        _unlink(tmp)
+        raise EmbedderUnavailable(f"could not download the model: {exc}") from exc
+    return path
+
+
+def _unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
         pass
+
+
+def interpreter_class():
+    """The `Interpreter` of the first runtime that imports. None ships everywhere.
+
+    Import only: safe to call in the parent before the CPU pool forks, which
+    building an interpreter is not.
+    """
     try:
         from tflite_runtime.interpreter import Interpreter  # type: ignore
-        return Interpreter
     except ImportError:
-        pass
+        try:
+            from ai_edge_litert.interpreter import Interpreter  # type: ignore
+        except ImportError:
+            try:
+                from tensorflow.lite.python.interpreter import Interpreter  # type: ignore
+            except ImportError as exc:
+                raise EmbedderUnavailable(
+                    "no TFLite runtime; pip install ai-edge-litert (or tflite-runtime)"
+                ) from exc
+    return Interpreter
+
+
+def _load_interpreter(path: str):
+    # One thread: the CPU pool is already the parallelism, and letting each of N
+    # worker processes start its own thread pool is how a 32-core machine ends
+    # up with a thousand threads fighting over it. Same reasoning as
+    # `main._init_cpu_worker`.
+    return interpreter_class()(model_path=path, num_threads=1)
+
+
+def is_available(cache_dir: str = ".wanda-cache", explicit: str = "") -> bool:
+    """Whether embedding can run at all, without paying to find out twice."""
     try:
-        from tensorflow.lite import Interpreter  # type: ignore
-        return Interpreter
-    except ImportError as exc:  # pragma: no cover - environment problem
-        raise RuntimeError(
-            "No TFLite runtime found. Install 'ai-edge-litert' (see requirements.txt)."
-        ) from exc
+        interpreter(cache_dir, explicit)
+        return True
+    except EmbedderUnavailable:
+        return False
 
 
-def get_interpreter(model_path: Optional[str] = None):
-    path = os.path.abspath(model_path or _DEFAULT_MODEL)
-    cached = _INTERPRETERS.get(path)
-    if cached is not None:
-        return cached
-    with _LOCK:
-        cached = _INTERPRETERS.get(path)
-        if cached is None:
-            Interpreter = _load_runtime()
-            cached = Interpreter(model_path=path)
-            cached.allocate_tensors()
-            _INTERPRETERS[path] = cached
-    return cached
+def interpreter(cache_dir: str = ".wanda-cache", explicit: str = ""):
+    """This process's interpreter, built on first use.
 
-
-def _segment(samples: np.ndarray) -> np.ndarray:
-    """Fixed-length 1 s windows at a 0.5 s hop; the tail is zero-padded, not dropped.
-
-    A track shorter than one segment (rare, but jingles exist) still gets one
-    padded segment so it is never silently skipped.
+    Lazy and per-process on purpose. A TFLite interpreter holds native state
+    that does not survive `fork`, so one built in the parent before the pool
+    starts is a segfault waiting for the first worker to use it.
     """
-    samples = np.ascontiguousarray(samples, dtype=np.float32)
-    if samples.size < SEGMENT_SAMPLES:
-        samples = np.pad(samples, (0, SEGMENT_SAMPLES - samples.size))
-    n = 1 + (samples.size - SEGMENT_SAMPLES) // HOP_SAMPLES
-    remainder = samples.size - ((n - 1) * HOP_SAMPLES + SEGMENT_SAMPLES)
-    if remainder > 0:
-        pad = HOP_SAMPLES - remainder
-        samples = np.pad(samples, (0, pad))
-        n += 1
-    windows = np.lib.stride_tricks.sliding_window_view(samples, SEGMENT_SAMPLES)
-    return windows[::HOP_SAMPLES][:n]
+    global _interpreter
+    if _interpreter is None:
+        with _interpreter_lock:
+            if _interpreter is None:
+                itp = _load_interpreter(model_path(cache_dir, explicit))
+                itp.allocate_tensors()
+                _interpreter = itp
+    return _interpreter
 
 
-def compute_embedding(samples: np.ndarray, interpreter=None,
-                      model_path: Optional[str] = None) -> bytes:
-    """Per-segment 128-d vectors for one track, as a big-endian float32 BLOB.
+def embed(samples: np.ndarray, cache_dir: str = ".wanda-cache",
+          explicit: str = "") -> np.ndarray:
+    """`(n, 128)` L2-normalised segment embeddings for mono 8 kHz float PCM."""
+    windows = segment(samples)
+    if windows.shape[0] == 0:
+        return np.zeros((0, EMBED_DIM), dtype=np.float32)
 
-    Layout: `n_segments` rows of `EMBED_DIM` values, row-major, `>f4`. That is
-    ~61 KB for a 60 s track (against ~2.5 MB of landmark rows), and keeping the
-    per-segment matrix -- rather than mean-pooling -- lets a 6 s microphone clip
-    be matched against any 6 s window of the track.
-    """
-    if interpreter is None:
-        interpreter = get_interpreter(model_path)
-    windows = _segment(samples)
-    if windows.size == 0:
-        return b""
+    itp = interpreter(cache_dir, explicit)
+    in_detail = itp.get_input_details()[0]
+    out_detail = itp.get_output_details()[0]
 
-    in_detail = interpreter.get_input_details()[0]
-    out_detail = interpreter.get_output_details()[0]
-    in_index, out_index = in_detail["index"], out_detail["index"]
+    out = np.empty((windows.shape[0], EMBED_DIM), dtype=np.float32)
+    for i in range(windows.shape[0]):
+        itp.set_tensor(in_detail["index"], windows[i].reshape(1, SEGMENT_SAMPLES))
+        itp.invoke()
+        out[i] = itp.get_tensor(out_detail["index"])[0]
 
-    out = np.empty((len(windows), EMBED_DIM), dtype=np.float32)
-    for i, window in enumerate(windows):
-        interpreter.set_tensor(in_index, window[np.newaxis, :].astype(np.float32))
-        interpreter.invoke()
-        out[i] = interpreter.get_tensor(out_index)[0]
-
-    # The model L2-normalises already; redo it so the fp16 round-off cannot leave
-    # a vector slightly off the unit sphere and bias later cosine scores.
+    # Re-normalise, as the app does: fp16 round-off inside the graph leaves the
+    # vector fractionally off the unit sphere, and every later cosine inherits
+    # the error as a per-track bias.
     norms = np.linalg.norm(out, axis=1, keepdims=True)
     np.divide(out, norms, out=out, where=norms > 0)
-    return out.astype(">f4").tobytes()
-
-
-def unpack_embedding(blob: bytes) -> np.ndarray:
-    """Inverse of `compute_embedding`: (n_segments, EMBED_DIM) float32."""
-    flat = np.frombuffer(blob, dtype=">f4")
-    return flat.reshape(-1, EMBED_DIM).astype(np.float32)
+    return out
