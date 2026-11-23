@@ -262,9 +262,12 @@ def preflight(args, write=print) -> bool:
 
     counts = db_sync.count_index_rows(args.db)
     # None where the app's schema has dropped the table -- a current database has
-    # no `fingerprints` or recording tables at all, and that is not a fault.
+    # no `fingerprints` or recording tables at all, and that is not a fault. An
+    # empty `fingerprints` (recreated before a push) is left out as well, so a
+    # cut-over database does not report a permanent "0 landmarks".
     present = ", ".join(
-        f"{name} {count:,}" for name, count in counts.items() if count is not None
+        f"{name} {count:,}" for name, count in counts.items()
+        if count is not None and not (name == "fingerprints" and count == 0)
     )
     write(f"[DB]    {present}")
 
@@ -274,12 +277,13 @@ def preflight(args, write=print) -> bool:
     if indexed and complete < indexed:
         write(f"        {indexed - complete:,} stop short and will be re-measured "
               f"(indexing used to read only the first minute)")
-    try:
+    if not args.no_embeddings:
         from core import embedder
-        embedder.model_path(args.cache_dir, args.embedder_model)
-        write("[MODEL] wanda_embedder.tflite present and verified")
-    except embedder.EmbedderUnavailable as exc:
-        write(f"[WARN]  embeddings unavailable: {exc}")
+        try:
+            embedder.model_path(args.cache_dir, args.embedder_model)
+            write("[MODEL] wanda_embedder.tflite present and verified")
+        except embedder.EmbedderUnavailable as exc:
+            write(f"[WARN]  embeddings unavailable: {exc}")
     if args.check:
         # An explicit check is allowed to pay for the full verification; the
         # indexing path gets it for free on the local working copy instead.
@@ -325,10 +329,17 @@ def parse_args(argv=None):
     parser.add_argument("--limit", type=int, default=0, help="Process at most N tracks (0 = all)")
     parser.add_argument("--source", action="append", default=[], metavar="NAME",
                         help="Only index these sources (e.g. --source NAVIDROME); repeatable")
-    parser.add_argument("--no-embeddings", action="store_true",
+    parser.add_argument("--no-embeddings", "--no-embed", dest="no_embeddings",
+                        action="store_true",
                         help="Skip the neural fingerprint (the index the app searches)")
-    parser.add_argument("--embedder-model", default="",
-                        help="Path to wanda_embedder.tflite; downloaded and cached if omitted")
+    parser.add_argument("--embedder-model", "--embed-model", dest="embedder_model", default="",
+                        help="Path to wanda_embedder.tflite; if omitted, "
+                             "models/wanda_embedder.tflite beside this script is used when "
+                             "present, else the model is downloaded and cached")
+    parser.add_argument("--no-landmarks", action="store_true",
+                        help="Skip the landmark constellation. The neural embedding has replaced "
+                             "it for recognition, so computing landmarks costs CPU and grows the "
+                             "database by ~18k rows a track for an index nothing reads.")
     parser.add_argument("--seconds", type=int, default=1200,
                         help="Seconds of each track to read (default: 20 minutes, i.e. all of "
                              "it). Was 60, which is why stored vectors describe only a song's "
@@ -362,9 +373,24 @@ def parse_args(argv=None):
     parser.add_argument("--check", action="store_true", help="Run preflight checks and exit")
     parser.add_argument("--repair", action="store_true",
                         help="Rebuild a corrupt database, preserving all readable rows")
+    parser.add_argument("--shrink", action="store_true",
+                        help="Convert fingerprints to WITHOUT ROWID (measured ~42%% smaller) "
+                             "and VACUUM; requires the app on Android running the matching "
+                             "MIGRATION_23_24 (@Database version 24)")
     parser.add_argument("--backfill-subhashes", action="store_true",
                         help="Rebuild the recording sub-hash index from stored fingerprints "
                              "(no audio needed); required for dedupe and inbound Agro sync")
+    parser.add_argument("--push", action="store_true",
+                        help="Send the finished database to the phone over adb and force-stop "
+                             "the app so Room rereads it. The phone's likes, play counts, "
+                             "history and drops are read back and merged in first")
+    parser.add_argument("--push-overwrite", action="store_true",
+                        help="Push without merging, replacing the phone's likes and history "
+                             "with this database's copy of them")
+    parser.add_argument("--index-lyrics", action="store_true",
+                        help="Fetch and index song lyrics into track_lyrics and lyrics_fts")
+    parser.add_argument("--search-lyrics", default="", metavar="QUERY",
+                        help="Search lyrics_fts for QUERY in the SQLite database and display results")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be indexed without touching the network")
     return parser.parse_args(argv)
@@ -423,6 +449,124 @@ def main(argv=None) -> int:
             db_sync.finalize_database(working_db)
         return 0
 
+    if args.search_lyrics:
+        if not os.path.exists(args.db):
+            print(f"[ERROR] Database not found: {args.db}")
+            return 1
+        results = db_sync.search_lyrics_fts(args.db, args.search_lyrics)
+        if not results:
+            print(f"[LYRICS] No songs found matching: '{args.search_lyrics}'")
+            return 0
+        print(f"[LYRICS] Found {len(results)} match(es) for '{args.search_lyrics}':")
+        for r in results:
+            title = r.get("title") or r.get("trackId")
+            artist = r.get("artist") or "Unknown"
+            print(f"  • {title} - {artist}")
+            print(f"    Snippet: {r.get('snippet', '').strip()}")
+            if r.get("syncedLyrics"):
+                from core.lyrics_indexer import find_matching_lyric_line
+                ts, line = find_matching_lyric_line(r.get("plainLyrics"), r.get("syncedLyrics"), args.search_lyrics)
+                if ts is not None:
+                    sec = ts // 1000
+                    print(f"    Exact line [{sec//60:02d}:{sec%60:02d}]: \"{line}\"")
+        return 0
+
+    if args.index_lyrics:
+        if not os.path.exists(args.db):
+            print(f"[ERROR] Database not found: {args.db}")
+            return 1
+        from core import lyrics_indexer
+        conn = db_sync.connect(args.db)
+        db_sync.ensure_lyrics_tables(conn)
+        rows = conn.execute("""
+            SELECT t.id, t.title, t.artist, t.album, t.durationMs, t.localFilePath
+            FROM tracks t
+            LEFT JOIN track_lyrics l ON l.trackId = t.id
+            WHERE l.trackId IS NULL;
+        """).fetchall()
+
+        # Cache existing lyrics by (title, artist) so other sources (e.g. Navidrome vs YTM) reuse immediately
+        existing_rows = conn.execute("""
+            SELECT LOWER(t.title), LOWER(t.artist), l.plainLyrics, l.syncedLyrics, l.source
+            FROM track_lyrics l
+            JOIN tracks t ON t.id = l.trackId;
+        """).fetchall()
+        lyrics_cache_by_name = {
+            (r[0].strip(), r[1].strip()): {
+                "plainLyrics": r[2],
+                "syncedLyrics": r[3],
+                "source": f"{r[4]} (reused)"
+            }
+            for r in existing_rows if r[0] and r[1]
+        }
+        conn.close()
+
+        print(f"[LYRICS] {len(rows)} track(s) need lyrics indexing.")
+        if not rows:
+            return 0
+
+        lyrics_by_track = {}
+        found_count = 0
+        for idx, (tid, title, artist, album, duration_ms, local_path) in enumerate(rows, 1):
+            dur_s = (duration_ms / 1000.0) if duration_ms else None
+            lyric_data = None
+            clean_name_key = (title.strip().lower(), artist.strip().lower())
+            if clean_name_key in lyrics_cache_by_name:
+                lyric_data = lyrics_cache_by_name[clean_name_key]
+            if not lyric_data and local_path:
+                lyric_data = lyrics_indexer.extract_local_tags_lyrics(local_path)
+            if not lyric_data:
+                lyric_data = lyrics_indexer.fetch_lrclib_lyrics(title, artist, album, dur_s)
+                time.sleep(0.25)
+            if lyric_data:
+                lyrics_by_track[tid] = lyric_data
+                lyrics_cache_by_name[clean_name_key] = lyric_data
+                found_count += 1
+                print(f"[{idx}/{len(rows)}] Found: {title} - {artist} ({lyric_data['source']})")
+            else:
+                print(f"[{idx}/{len(rows)}] No lyrics: {title} - {artist}")
+
+            if len(lyrics_by_track) >= 20:
+                db_sync.batch_insert_lyrics(args.db, lyrics_by_track)
+                lyrics_by_track.clear()
+
+        if lyrics_by_track:
+            db_sync.batch_insert_lyrics(args.db, lyrics_by_track)
+        print(f"[LYRICS] Indexed lyrics for {found_count}/{len(rows)} tracks.")
+        return 0
+
+    if args.shrink:
+        if not os.path.exists(args.db):
+            print(f"[ERROR] Database not found: {args.db}")
+            return 1
+        ok, problems = db_sync.quick_sanity(args.db)
+        if not ok:
+            print(f"[ERROR] {problems[0]}")
+            print("        Run --repair first.")
+            return 1
+        before_size = os.path.getsize(args.db)
+        staging = db_sync.StagedDatabase(args.db, enabled=not args.no_stage,
+                                         work_dir=args.work_dir)
+        with staging as working_db:
+            if staging.corrupt:
+                print("\n[ERROR] Database failed its integrity check. Run --repair first.")
+                return 1
+            db_sync.drop_legacy_sub_hashes(working_db)
+            db_sync.shrink_fingerprints_table(working_db)
+            db_sync.vacuum(working_db)
+            db_sync.finalize_database(working_db)
+            ok, problems = db_sync.check_integrity(working_db, thorough=True)
+            if not ok:
+                print(f"[ERROR] Shrunk database failed integrity check: "
+                      f"{db_sync.summarise_damage(problems)}")
+                print("        The original database was not modified until this point in the "
+                      "staged copy; aborting before writing it back.")
+                return 1
+        after_size = os.path.getsize(args.db)
+        print(f"[SHRINK] {before_size / 1e9:.2f} GB -> {after_size / 1e9:.2f} GB "
+              f"({(1 - after_size / before_size) * 100:.0f}% smaller)")
+        return 0
+
     if not preflight(args):
         return 1
     if args.check:
@@ -430,22 +574,44 @@ def main(argv=None) -> int:
 
     path_map = parse_path_map(args.map_local_path)
 
+    # Resolved once, here, so every worker is handed the same verified file
+    # rather than each racing to download it. Without a runtime and a model,
+    # embeddings are skipped and the run still writes whatever else is pending.
+    want_embeddings = False
+    if args.no_embeddings:
+        print("[INDEXER] Neural embeddings disabled (--no-embeddings).")
+    else:
+        from core import embedder
+        try:
+            embedder.interpreter_class()
+            args.embedder_model = embedder.model_path(args.cache_dir, args.embedder_model)
+            want_embeddings = True
+            print(f"[INDEXER] Neural embedder: {args.embedder_model}")
+        except embedder.EmbedderUnavailable as exc:
+            print(f"[WARN]  Embeddings unavailable ({exc}); they will be skipped this run.")
+
     print("\n[INDEXER] Scanning for tracks that need indexing ...")
     with Spinner("[INDEXER] scanning", enabled=db_sync.is_slow_mount(args.db)):
-        pending = db_sync.get_pending_tracks(args.db)
+        pending = db_sync.get_pending_tracks(args.db, want_embeddings=want_embeddings)
+    if args.no_landmarks:
+        # Cleared here rather than in the query so the pending scan stays one code path. A track
+        # whose only outstanding work was landmarks now has none, and decoding it would buy
+        # nothing, so it drops out of the run entirely.
+        print("[INDEXER] Landmark constellation disabled (--no-landmarks).")
+        for track in pending:
+            track["needs_landmarks"] = False
+        pending = [
+            t for t in pending
+            if t["needs_features"] or t["needs_recording_fp"] or t["needs_embedding"]
+        ]
+
     if args.source:
         wanted = {name.upper() for name in args.source}
         pending = [t for t in pending if (t["source"] or "").upper() in wanted]
     if args.limit > 0:
         pending = pending[: args.limit]
 
-    if args.no_embeddings:
-        for track in pending:
-            track["needs_embedding"] = False
-        pending = [t for t in pending if any(
-            t.get(f) for f in ("needs_landmarks", "needs_features", "needs_recording_fp")
-        )]
-    else:
+    if want_embeddings:
         for track in pending:
             track["embedder_model"] = args.embedder_model
             track["cache_dir"] = args.cache_dir
@@ -575,7 +741,7 @@ def run_pipeline(args, pending, resolver, limiter, cache, reporter,
                 return
             counts = db_sync.batch_insert_index_data(
                 args.db, buffered_landmarks, buffered_features, buffered_recordings,
-                buffered_embeddings
+                buffered_embeddings,
             )
             counts["tracks"] = len(buffered_tracks)
             reporter.checkpoint(counts)
@@ -666,6 +832,41 @@ def run_pipeline(args, pending, resolver, limiter, cache, reporter,
             exit_code = exit_code or 1
         cache.flush()
 
+    if exit_code == 0:
+        db_sync.deduplicate_by_embeddings(args.db, log=reporter.log)
+        db_sync.drop_legacy_sub_hashes(args.db, log=reporter.log)
+
+    if args.push and exit_code == 0:
+        # The app still declares the landmark entity, so a database that has had `fingerprints`
+        # dropped fails Room's schema check on open — and Room's response to that is to delete
+        # the file. Recreate it empty before the database leaves this machine.
+        conn = db_sync.connect(args.db)
+        try:
+            db_sync.ensure_landmarks_table(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Likes, play counts, history and drops only ever happen on the phone, and they live as
+        # columns on `tracks` rather than in tables of their own. Replacing the file to deliver
+        # new fingerprints therefore reverts all of it to whatever this copy last captured, so
+        # the phone's version is read back and merged in first.
+        if not args.push_overwrite:
+            phone_copy = args.db + ".phone.tmp"
+            if db_sync.pull_database(phone_copy, log=print):
+                try:
+                    db_sync.merge_user_data(phone_copy, args.db, log=print)
+                finally:
+                    if os.path.exists(phone_copy):
+                        os.remove(phone_copy)
+            else:
+                print("[MERGE] Could not read the phone's database; refusing to push over its "
+                      "likes and history. Re-run with --push-overwrite to push anyway.")
+                return 1
+
+        if not db_sync.push_database(args.db, log=print):
+            exit_code = 1
+
     return exit_code
 
 
@@ -702,7 +903,10 @@ def _handle_fetch_result(future, track, reporter, cpu_pool, cpu_futures, buffers
         )
         return
 
-    reporter.stage(key, "embedding" if track.get("needs_embedding") else "landmarks")
+    # "analyse", not "landmarks": this one stage covers every legacy extractor, and naming it
+    # after the one that has been removed reported the embedding time as landmark time in the
+    # summary. A track that needs an embedding spends most of the stage there, so it says so.
+    reporter.stage(key, "embedding" if track.get("needs_embedding") else "analyse")
     samples = outcome["samples"]
     call = (
         samples,

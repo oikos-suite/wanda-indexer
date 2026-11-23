@@ -58,6 +58,12 @@ MODEL_SHA256 = "50a26e9f19dbaa35de7a1efda1c3b69d471e83f860c53c7df184431e754455aa
 MODEL_SIZE_BYTES = 35_892_012
 MODEL_FILENAME = "wanda_embedder.tflite"
 
+# Where `models/README.md` and `tools/build_embedder_tflite.py` put the file. A
+# copy there of the pinned size is used before anything is downloaded.
+LOCAL_MODEL = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", MODEL_FILENAME
+)
+
 _interpreter = None
 _interpreter_lock = threading.Lock()
 
@@ -149,11 +155,18 @@ def summary(vectors: np.ndarray) -> np.ndarray:
 
 
 def model_path(cache_dir: str = ".wanda-cache", explicit: str = "") -> str:
-    """The model file, downloading and verifying it once if it is not here yet."""
+    """The model file, downloading and verifying it once if it is not here yet.
+
+    In order: `explicit`, then `models/wanda_embedder.tflite` beside this
+    checkout, then the cached download.
+    """
     if explicit:
         if not os.path.isfile(explicit):
             raise EmbedderUnavailable(f"model file not found: {explicit}")
         return explicit
+
+    if os.path.isfile(LOCAL_MODEL) and os.path.getsize(LOCAL_MODEL) == MODEL_SIZE_BYTES:
+        return LOCAL_MODEL
 
     os.makedirs(cache_dir, exist_ok=True)
     path = os.path.join(cache_dir, MODEL_FILENAME)
@@ -191,8 +204,12 @@ def _unlink(path: str) -> None:
         pass
 
 
-def _load_interpreter(path: str):
-    """The first runtime that imports. Neither ships on every platform."""
+def interpreter_class():
+    """The `Interpreter` of the first runtime that imports. None ships everywhere.
+
+    Import only: safe to call in the parent before the CPU pool forks, which
+    building an interpreter is not.
+    """
     try:
         from tflite_runtime.interpreter import Interpreter  # type: ignore
     except ImportError:
@@ -205,11 +222,15 @@ def _load_interpreter(path: str):
                 raise EmbedderUnavailable(
                     "no TFLite runtime; pip install ai-edge-litert (or tflite-runtime)"
                 ) from exc
+    return Interpreter
+
+
+def _load_interpreter(path: str):
     # One thread: the CPU pool is already the parallelism, and letting each of N
     # worker processes start its own thread pool is how a 32-core machine ends
     # up with a thousand threads fighting over it. Same reasoning as
     # `main._init_cpu_worker`.
-    return Interpreter(model_path=path, num_threads=1)
+    return interpreter_class()(model_path=path, num_threads=1)
 
 
 def is_available(cache_dir: str = ".wanda-cache", explicit: str = "") -> bool:
