@@ -50,7 +50,7 @@ the combination is compliant; this derived model inherits AGPL-3.0. Do not relic
 
   ```
   gh release create embedder-v1 models/wanda_embedder.tflite \
-    --repo AgroUPlus/Wanda --title "Recognition model v1" --notes "nmfp-triplet, 8kHz/128-d"
+    --repo oikos-suite/Wanda --title "Recognition model v1" --notes "nmfp-triplet, 8kHz/128-d"
   ```
 
   When the model is rebuilt, bump `MODEL_URL` / `SHA256` / `SIZE_BYTES` in
