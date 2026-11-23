@@ -9,7 +9,7 @@ import urllib.request
 import urllib.error
 from typing import Any, Dict, List, Optional, Tuple
 
-USER_AGENT = "Wanda/1.5.0 (https://github.com/AgroUPlus/Wanda)"
+USER_AGENT = "Wanda/1.5.0 (https://github.com/oikos-suite/Wanda)"
 LRCLIB_BASE_URL = "https://lrclib.net/api/get"
 LRC_REGEX = re.compile(r"^\[(\d{2}):(\d{2})\.(\d{2,3})\](.*)$")
 
