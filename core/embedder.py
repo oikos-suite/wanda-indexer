@@ -52,7 +52,7 @@ HOP_SAMPLES = 4000              # 0.5 s -- the model's training fingerprint rate
 # digest: a truncated or substituted model produces plausible vectors that match
 # nothing, which is the one failure that would not announce itself.
 MODEL_URL = (
-    "https://github.com/AgroUPlus/Wanda/releases/download/embedder-v1/wanda_embedder.tflite"
+    "https://github.com/oikos-suite/Wanda/releases/download/embedder-v1/wanda_embedder.tflite"
 )
 MODEL_SHA256 = "50a26e9f19dbaa35de7a1efda1c3b69d471e83f860c53c7df184431e754455aa"
 MODEL_SIZE_BYTES = 35_892_012
