@@ -12,8 +12,8 @@ This document tracks the current verified state of the Wanda indexing pipeline, 
 - **Sub-hash index coverage**: Fixed missing index entries; previously 1,238 / 1,355 tracks lacked index entries (91% invisible). Now 100% of tracks (1,355/1,355) are indexed in `recording_sub_hashes`.
 - **Duplicate detection results**: Real library duplicate detection improved from 32 (or 44/60) to 43 of 44 duplicate pairs (59/60 app candidate pairs), with the only miss being an authentic alternate recording (*Mantis Lords*).
 - **Git Repositories & PRs**:
-  - `wanda-indexer`: Initialized, cleaned (`.gitignore`, `.env.example`, tools, tests), pushed to [`AgroUPlus/wanda-indexer:main`](https://github.com/AgroUPlus/wanda-indexer).
-  - `Wanda` (Android): Committed vote-based alignment, tests, and `MIGRATION_23_24` (`WITHOUT ROWID`); opened PR [#67](https://github.com/AgroUPlus/Wanda/pull/67).
+  - `wanda-indexer`: Initialized, cleaned (`.gitignore`, `.env.example`, tools, tests), pushed to [`oikos-suite/wanda-indexer:main`](https://github.com/oikos-suite/wanda-indexer).
+  - `Wanda` (Android): Committed vote-based alignment, tests, and `MIGRATION_23_24` (`WITHOUT ROWID`); opened PR [#67](https://github.com/oikos-suite/Wanda/pull/67).
 
 ---
 
